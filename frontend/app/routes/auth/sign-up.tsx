@@ -44,9 +44,8 @@ const SignUp = () => {
   const handleOnSubmit = (values: SignupFormData) => {
     mutate(values, {
       onSuccess: () => {
-        toast.success("Email Verification Required", {
-          description:
-            "Please check your email for a verification link. If you don't see it, please check your spam folder.",
+        toast.success("Account created", {
+          description: "You can now sign in with your new account.",
         });
 
         form.reset();
