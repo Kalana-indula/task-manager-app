@@ -58,35 +58,15 @@ const registerUser = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashPassword = await bcrypt.hash(password, salt);
 
-    const newUser = await User.create({
+    await User.create({
       email,
       password: hashPassword,
       name,
+      isEmailVerified: true,
     });
 
-    const verificationToken = signToken(
-      { userId: newUser._id, purpose: "email-verification" },
-      "1h"
-    );
-
-    await Verification.create({
-      userId: newUser._id,
-      token: verificationToken,
-      expiresAt: new Date(Date.now() + 1 * 60 * 60 * 1000),
-    });
-
-    // send email (non-blocking for dev)
-    const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
-    const emailBody = `<p>Click <a href="${verificationLink}">here</a> to verify your email</p>`;
-    const emailSubject = "Verify your email";
-
-    const isEmailSent = await trySendEmail(email, emailSubject, emailBody);
-
-    // IMPORTANT: do NOT fail signup if email fails (common best practice)
     return res.status(201).json({
-      message: isEmailSent
-        ? "Verification email sent. Please check your inbox."
-        : "Account created, but verification email could not be sent right now. Please try logging in to resend.",
+      message: "Account created successfully",
     });
   } catch (error) {
     console.log(error);
@@ -112,47 +92,6 @@ const loginUser = async (req, res) => {
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(400).json({ message: "Invalid email or password" });
-    }
-
-    // If not verified, (re)send verification link
-    if (!user.isEmailVerified) {
-      const existingVerification = await Verification.findOne({ userId: user._id });
-
-      // if already has a valid token, tell them to check email
-      if (existingVerification && existingVerification.expiresAt > new Date()) {
-        return res.status(400).json({
-          message: "Email not verified. Please check your email for the verification link.",
-        });
-      }
-
-      // if old token exists, delete it safely
-      if (existingVerification) {
-        await Verification.findByIdAndDelete(existingVerification._id);
-      }
-
-      const verificationToken = signToken(
-        { userId: user._id, purpose: "email-verification" },
-        "1h"
-      );
-
-      await Verification.create({
-        userId: user._id,
-        token: verificationToken,
-        expiresAt: new Date(Date.now() + 1 * 60 * 60 * 1000),
-      });
-
-      const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
-      const emailBody = `<p>Click <a href="${verificationLink}">here</a> to verify your email</p>`;
-      const emailSubject = "Verify your email";
-
-      const isEmailSent = await trySendEmail(email, emailSubject, emailBody);
-
-      // return 200/201 even if email fails, don’t crash
-      return res.status(200).json({
-        message: isEmailSent
-          ? "Verification email sent. Please check and verify your account."
-          : "Email not verified. We could not send the verification email right now. Try again later.",
-      });
     }
 
     // verified user -> login
