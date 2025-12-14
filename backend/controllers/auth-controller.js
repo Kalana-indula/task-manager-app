@@ -39,7 +39,9 @@ const registerUser = async (req, res) => {
 
     // basic validation (optional but helpful)
     if (!email || !name || !password) {
-      return res.status(400).json({ message: "email, name and password are required" });
+      return res
+        .status(400)
+        .json({ message: "email, name and password are required" });
     }
 
     // Arcjet protect
@@ -58,35 +60,15 @@ const registerUser = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashPassword = await bcrypt.hash(password, salt);
 
-    const newUser = await User.create({
+    await User.create({
       email,
       password: hashPassword,
       name,
+      isEmailVerified: true,
     });
 
-    const verificationToken = signToken(
-      { userId: newUser._id, purpose: "email-verification" },
-      "1h"
-    );
-
-    await Verification.create({
-      userId: newUser._id,
-      token: verificationToken,
-      expiresAt: new Date(Date.now() + 1 * 60 * 60 * 1000),
-    });
-
-    // send email (non-blocking for dev)
-    const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
-    const emailBody = `<p>Click <a href="${verificationLink}">here</a> to verify your email</p>`;
-    const emailSubject = "Verify your email";
-
-    const isEmailSent = await trySendEmail(email, emailSubject, emailBody);
-
-    // IMPORTANT: do NOT fail signup if email fails (common best practice)
     return res.status(201).json({
-      message: isEmailSent
-        ? "Verification email sent. Please check your inbox."
-        : "Account created, but verification email could not be sent right now. Please try logging in to resend.",
+      message: "Account created successfully",
     });
   } catch (error) {
     console.log(error);
@@ -101,7 +83,9 @@ const loginUser = async (req, res) => {
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ message: "email and password are required" });
+      return res
+        .status(400)
+        .json({ message: "email and password are required" });
     }
 
     const user = await User.findOne({ email }).select("+password");
@@ -114,52 +98,8 @@ const loginUser = async (req, res) => {
       return res.status(400).json({ message: "Invalid email or password" });
     }
 
-    // If not verified, (re)send verification link
-    if (!user.isEmailVerified) {
-      const existingVerification = await Verification.findOne({ userId: user._id });
-
-      // if already has a valid token, tell them to check email
-      if (existingVerification && existingVerification.expiresAt > new Date()) {
-        return res.status(400).json({
-          message: "Email not verified. Please check your email for the verification link.",
-        });
-      }
-
-      // if old token exists, delete it safely
-      if (existingVerification) {
-        await Verification.findByIdAndDelete(existingVerification._id);
-      }
-
-      const verificationToken = signToken(
-        { userId: user._id, purpose: "email-verification" },
-        "1h"
-      );
-
-      await Verification.create({
-        userId: user._id,
-        token: verificationToken,
-        expiresAt: new Date(Date.now() + 1 * 60 * 60 * 1000),
-      });
-
-      const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
-      const emailBody = `<p>Click <a href="${verificationLink}">here</a> to verify your email</p>`;
-      const emailSubject = "Verify your email";
-
-      const isEmailSent = await trySendEmail(email, emailSubject, emailBody);
-
-      // return 200/201 even if email fails, don’t crash
-      return res.status(200).json({
-        message: isEmailSent
-          ? "Verification email sent. Please check and verify your account."
-          : "Email not verified. We could not send the verification email right now. Try again later.",
-      });
-    }
-
     // verified user -> login
-    const token = signToken(
-      { userId: user._id, purpose: "login" },
-      "7d"
-    );
+    const token = signToken({ userId: user._id, purpose: "login" }, "7d");
 
     user.lastLogin = new Date();
     await user.save();
@@ -226,13 +166,19 @@ const resetPasswordRequest = async (req, res) => {
     if (!user) return res.status(400).json({ message: "User not found" });
 
     if (!user.isEmailVerified) {
-      return res.status(400).json({ message: "Please verify your email first" });
+      return res
+        .status(400)
+        .json({ message: "Please verify your email first" });
     }
 
-    const existingVerification = await Verification.findOne({ userId: user._id });
+    const existingVerification = await Verification.findOne({
+      userId: user._id,
+    });
 
     if (existingVerification && existingVerification.expiresAt > new Date()) {
-      return res.status(400).json({ message: "Reset password request already sent" });
+      return res
+        .status(400)
+        .json({ message: "Reset password request already sent" });
     }
 
     if (existingVerification) {
@@ -274,7 +220,9 @@ const verifyResetPasswordTokenAndResetPassword = async (req, res) => {
     const { token, newPassword, confirmPassword } = req.body;
 
     if (!token || !newPassword || !confirmPassword) {
-      return res.status(400).json({ message: "token, newPassword and confirmPassword are required" });
+      return res.status(400).json({
+        message: "token, newPassword and confirmPassword are required",
+      });
     }
 
     const payload = jwt.verify(token, getJwtSecret());
