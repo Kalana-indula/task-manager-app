@@ -5,28 +5,57 @@ import Verification from "../models/verification.js";
 import { sendEmail } from "../libs/send-email.js";
 import aj from "../libs/arcjet.js";
 
+// Small helper: ensure JWT secret exists
+const getJwtSecret = () => {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    throw new Error("JWT_SECRET is missing in environment variables");
+  }
+  return secret;
+};
+
+// Small helper: create tokens consistently
+const signToken = (payload, expiresIn) => {
+  return jwt.sign(payload, getJwtSecret(), { expiresIn });
+};
+
+// Small helper: in dev, don’t block core flows if email fails
+const trySendEmail = async (email, subject, body) => {
+  // Optional guard: if you want to skip when SendGrid key is invalid
+  // if (!process.env.SENDGRID_API_KEY?.startsWith("SG.")) return false;
+
+  try {
+    const ok = await sendEmail(email, subject, body);
+    return Boolean(ok);
+  } catch (err) {
+    console.warn("Email send failed (ignored):", err?.message || err);
+    return false;
+  }
+};
+
 const registerUser = async (req, res) => {
   try {
     const { email, name, password } = req.body;
 
+    // basic validation (optional but helpful)
+    if (!email || !name || !password) {
+      return res.status(400).json({ message: "email, name and password are required" });
+    }
+
+    // Arcjet protect
     const decision = await aj.protect(req, { email });
-    console.log("Arcjet decision", decision.isDenied());
+    console.log("Arcjet decision denied:", decision.isDenied());
 
     if (decision.isDenied()) {
-      res.writeHead(403, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ message: "Invalid email address" }));
+      return res.status(403).json({ message: "Invalid email address" });
     }
 
     const existingUser = await User.findOne({ email });
-
     if (existingUser) {
-      return res.status(400).json({
-        message: "Email address already in use",
-      });
+      return res.status(400).json({ message: "Email address already in use" });
     }
 
     const salt = await bcrypt.genSalt(10);
-
     const hashPassword = await bcrypt.hash(password, salt);
 
     const newUser = await User.create({
@@ -35,10 +64,9 @@ const registerUser = async (req, res) => {
       name,
     });
 
-    const verificationToken = jwt.sign(
+    const verificationToken = signToken(
       { userId: newUser._id, purpose: "email-verification" },
-      process.env.JWT_SECRET,
-      { expiresIn: "1h" }
+      "1h"
     );
 
     await Verification.create({
@@ -47,27 +75,24 @@ const registerUser = async (req, res) => {
       expiresAt: new Date(Date.now() + 1 * 60 * 60 * 1000),
     });
 
-    // send email
+    // send email (non-blocking for dev)
     const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
     const emailBody = `<p>Click <a href="${verificationLink}">here</a> to verify your email</p>`;
     const emailSubject = "Verify your email";
 
-    const isEmailSent = await sendEmail(email, emailSubject, emailBody);
+    const isEmailSent = await trySendEmail(email, emailSubject, emailBody);
 
-    if (!isEmailSent) {
-      return res.status(500).json({
-        message: "Failed to send verification email",
-      });
-    }
-
-    res.status(201).json({
-      message:
-        "Verification email sent to your email. Please check and verify your account.",
+    // IMPORTANT: do NOT fail signup if email fails (common best practice)
+    return res.status(201).json({
+      message: isEmailSent
+        ? "Verification email sent. Please check your inbox."
+        : "Account created, but verification email could not be sent right now. Please try logging in to resend.",
     });
   } catch (error) {
     console.log(error);
-
-    res.status(500).json({ message: "Internal server error" });
+    return res.status(500).json({
+      message: error?.message || "Internal server error",
+    });
   }
 };
 
@@ -75,67 +100,65 @@ const loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email }).select("+password");
+    if (!email || !password) {
+      return res.status(400).json({ message: "email and password are required" });
+    }
 
+    const user = await User.findOne({ email }).select("+password");
     if (!user) {
       return res.status(400).json({ message: "Invalid email or password" });
     }
 
-    if (!user.isEmailVerified) {
-      const existingVerification = await Verification.findOne({
-        userId: user._id,
-      });
-
-      if (existingVerification && existingVerification.expiresAt > new Date()) {
-        return res.status(400).json({
-          message:
-            "Email not verified. Please check your email for the verification link.",
-        });
-      } else {
-        await Verification.findByIdAndDelete(existingVerification._id);
-
-        const verificationToken = jwt.sign(
-          { userId: user._id, purpose: "email-verification" },
-          process.env.JWT_SECRET,
-          { expiresIn: "1h" }
-        );
-
-        await Verification.create({
-          userId: user._id,
-          token: verificationToken,
-          expiresAt: new Date(Date.now() + 1 * 60 * 60 * 1000),
-        });
-
-        // send email
-        const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
-        const emailBody = `<p>Click <a href="${verificationLink}">here</a> to verify your email</p>`;
-        const emailSubject = "Verify your email";
-
-        const isEmailSent = await sendEmail(email, emailSubject, emailBody);
-
-        if (!isEmailSent) {
-          return res.status(500).json({
-            message: "Failed to send verification email",
-          });
-        }
-
-        res.status(201).json({
-          message:
-            "Verification email sent to your email. Please check and verify your account.",
-        });
-      }
-    }
-
     const isPasswordValid = await bcrypt.compare(password, user.password);
-
     if (!isPasswordValid) {
       return res.status(400).json({ message: "Invalid email or password" });
     }
 
-    const token = jwt.sign(
+    // If not verified, (re)send verification link
+    if (!user.isEmailVerified) {
+      const existingVerification = await Verification.findOne({ userId: user._id });
+
+      // if already has a valid token, tell them to check email
+      if (existingVerification && existingVerification.expiresAt > new Date()) {
+        return res.status(400).json({
+          message: "Email not verified. Please check your email for the verification link.",
+        });
+      }
+
+      // if old token exists, delete it safely
+      if (existingVerification) {
+        await Verification.findByIdAndDelete(existingVerification._id);
+      }
+
+      const verificationToken = signToken(
+        { userId: user._id, purpose: "email-verification" },
+        "1h"
+      );
+
+      await Verification.create({
+        userId: user._id,
+        token: verificationToken,
+        expiresAt: new Date(Date.now() + 1 * 60 * 60 * 1000),
+      });
+
+      const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
+      const emailBody = `<p>Click <a href="${verificationLink}">here</a> to verify your email</p>`;
+      const emailSubject = "Verify your email";
+
+      const isEmailSent = await trySendEmail(email, emailSubject, emailBody);
+
+      // return 200/201 even if email fails, don’t crash
+      return res.status(200).json({
+        message: isEmailSent
+          ? "Verification email sent. Please check and verify your account."
+          : "Email not verified. We could not send the verification email right now. Try again later.",
+      });
+    }
+
+    // verified user -> login
+    const token = signToken(
       { userId: user._id, purpose: "login" },
-      process.env.JWT_SECRET,
-      { expiresIn: "7d" }
+      "7d"
     );
 
     user.lastLogin = new Date();
@@ -144,54 +167,38 @@ const loginUser = async (req, res) => {
     const userData = user.toObject();
     delete userData.password;
 
-    res.status(200).json({
+    return res.status(200).json({
       message: "Login successful",
       token,
       user: userData,
     });
   } catch (error) {
     console.log(error);
-
-    res.status(500).json({ message: "Internal server error" });
+    return res.status(500).json({
+      message: error?.message || "Internal server error",
+    });
   }
 };
 
 const verifyEmail = async (req, res) => {
   try {
     const { token } = req.body;
+    const payload = jwt.verify(token, getJwtSecret());
 
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-
-    if (!payload) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
-
-    const { userId, purpose } = payload;
-
+    const { userId, purpose } = payload || {};
     if (purpose !== "email-verification") {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    const verification = await Verification.findOne({
-      userId,
-      token,
-    });
+    const verification = await Verification.findOne({ userId, token });
+    if (!verification) return res.status(401).json({ message: "Unauthorized" });
 
-    if (!verification) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
-
-    const isTokenExpired = verification.expiresAt < new Date();
-
-    if (isTokenExpired) {
+    if (verification.expiresAt < new Date()) {
       return res.status(401).json({ message: "Token expired" });
     }
 
     const user = await User.findById(userId);
-
-    if (!user) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
+    if (!user) return res.status(401).json({ message: "Unauthorized" });
 
     if (user.isEmailVerified) {
       return res.status(400).json({ message: "Email already verified" });
@@ -202,10 +209,12 @@ const verifyEmail = async (req, res) => {
 
     await Verification.findByIdAndDelete(verification._id);
 
-    res.status(200).json({ message: "Email verified successfully" });
+    return res.status(200).json({ message: "Email verified successfully" });
   } catch (error) {
     console.log(error);
-    res.status(500).json({ message: "Internal server error" });
+    return res.status(500).json({
+      message: error?.message || "Internal server error",
+    });
   }
 };
 
@@ -214,35 +223,25 @@ const resetPasswordRequest = async (req, res) => {
     const { email } = req.body;
 
     const user = await User.findOne({ email });
-
-    if (!user) {
-      return res.status(400).json({ message: "User not found" });
-    }
+    if (!user) return res.status(400).json({ message: "User not found" });
 
     if (!user.isEmailVerified) {
-      return res
-        .status(400)
-        .json({ message: "Please verify your email first" });
+      return res.status(400).json({ message: "Please verify your email first" });
     }
 
-    const existingVerification = await Verification.findOne({
-      userId: user._id,
-    });
+    const existingVerification = await Verification.findOne({ userId: user._id });
 
     if (existingVerification && existingVerification.expiresAt > new Date()) {
-      return res.status(400).json({
-        message: "Reset password request already sent",
-      });
+      return res.status(400).json({ message: "Reset password request already sent" });
     }
 
-    if (existingVerification && existingVerification.expiresAt < new Date()) {
+    if (existingVerification) {
       await Verification.findByIdAndDelete(existingVerification._id);
     }
 
-    const resetPasswordToken = jwt.sign(
+    const resetPasswordToken = signToken(
       { userId: user._id, purpose: "reset-password" },
-      process.env.JWT_SECRET,
-      { expiresIn: "15m" }
+      "15m"
     );
 
     await Verification.create({
@@ -255,18 +254,18 @@ const resetPasswordRequest = async (req, res) => {
     const emailBody = `<p>Click <a href="${resetPasswordLink}">here</a> to reset your password</p>`;
     const emailSubject = "Reset your password";
 
-    const isEmailSent = await sendEmail(email, emailSubject, emailBody);
+    const isEmailSent = await trySendEmail(email, emailSubject, emailBody);
 
-    if (!isEmailSent) {
-      return res.status(500).json({
-        message: "Failed to send reset password email",
-      });
-    }
-
-    res.status(200).json({ message: "Reset password email sent" });
+    return res.status(200).json({
+      message: isEmailSent
+        ? "Reset password email sent"
+        : "Reset token created, but email could not be sent right now. Try again later.",
+    });
   } catch (error) {
     console.log(error);
-    res.status(500).json({ message: "Internal server error" });
+    return res.status(500).json({
+      message: error?.message || "Internal server error",
+    });
   }
 };
 
@@ -274,45 +273,32 @@ const verifyResetPasswordTokenAndResetPassword = async (req, res) => {
   try {
     const { token, newPassword, confirmPassword } = req.body;
 
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-
-    if (!payload) {
-      return res.status(401).json({ message: "Unauthorized" });
+    if (!token || !newPassword || !confirmPassword) {
+      return res.status(400).json({ message: "token, newPassword and confirmPassword are required" });
     }
 
-    const { userId, purpose } = payload;
+    const payload = jwt.verify(token, getJwtSecret());
+    const { userId, purpose } = payload || {};
 
     if (purpose !== "reset-password") {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    const verification = await Verification.findOne({
-      userId,
-      token,
-    });
+    const verification = await Verification.findOne({ userId, token });
+    if (!verification) return res.status(401).json({ message: "Unauthorized" });
 
-    if (!verification) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
-
-    const isTokenExpired = verification.expiresAt < new Date();
-
-    if (isTokenExpired) {
+    if (verification.expiresAt < new Date()) {
       return res.status(401).json({ message: "Token expired" });
     }
 
     const user = await User.findById(userId);
-
-    if (!user) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
+    if (!user) return res.status(401).json({ message: "Unauthorized" });
 
     if (newPassword !== confirmPassword) {
       return res.status(400).json({ message: "Passwords do not match" });
     }
 
     const salt = await bcrypt.genSalt(10);
-
     const hashPassword = await bcrypt.hash(newPassword, salt);
 
     user.password = hashPassword;
@@ -320,12 +306,15 @@ const verifyResetPasswordTokenAndResetPassword = async (req, res) => {
 
     await Verification.findByIdAndDelete(verification._id);
 
-    res.status(200).json({ message: "Password reset successfully" });
+    return res.status(200).json({ message: "Password reset successfully" });
   } catch (error) {
     console.log(error);
-    res.status(500).json({ message: "Internal server error" });
+    return res.status(500).json({
+      message: error?.message || "Internal server error",
+    });
   }
 };
+
 export {
   registerUser,
   loginUser,
